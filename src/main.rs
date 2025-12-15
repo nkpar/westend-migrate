@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use subxt::{
     backend::{legacy::LegacyRpcMethods, rpc::RpcClient},
     dynamic::{At, Value},
+    rpc_params,
     tx::Signer,
     OnlineClient, PolkadotConfig,
 };
@@ -322,30 +323,17 @@ impl MigrationBot {
         warn!("Timeout waiting for pending tx, proceeding anyway...");
     }
 
-    /// Get account nonce
+    /// Get account nonce using system_accountNextIndex RPC
+    /// This includes pending transactions, unlike storage queries
     async fn get_account_nonce(&self, account_id: &subxt::utils::AccountId32) -> Result<u32> {
-        let nonce_query = subxt::dynamic::storage(
-            "System",
-            "Account",
-            vec![Value::from_bytes(AsRef::<[u8]>::as_ref(account_id))],
-        );
-
-        let account_info = self
-            .client
-            .storage()
-            .at_latest()
-            .await?
-            .fetch(&nonce_query)
-            .await?;
-
-        match account_info {
-            Some(info) => {
-                let value = info.to_value()?;
-                let nonce = value.at("nonce").and_then(|v| v.as_u128()).unwrap_or(0) as u32;
-                Ok(nonce)
-            }
-            None => Ok(0),
-        }
+        // Use RPC call which includes pending transactions
+        let params = rpc_params![account_id.to_string()];
+        let nonce: u32 = self
+            .raw_rpc
+            .request("system_accountNextIndex", params)
+            .await
+            .context("Failed to get account nonce via RPC")?;
+        Ok(nonce)
     }
 
     /// Query SignedMigrationMaxLimits from chain

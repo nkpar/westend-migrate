@@ -64,6 +64,66 @@ scp ./target/release/westend-migrate server:~/
 ssh server 'SIGNER_SEED="..." ./westend-migrate --runs 10 --rpc-url ws://127.0.0.1:9944 --no-notify'
 ```
 
+### Using run_remote.sh
+
+The included `run_remote.sh` script provides automated remote deployment with monitoring:
+
+```bash
+# Configure .env file
+cat > .env <<EOF
+SIGNER_SEED="your mnemonic phrase"
+SERVER=your-ssh-alias
+EOF
+
+# Run continuous migration
+./run_remote.sh
+
+# Run specific number of migrations
+./run_remote.sh 50
+```
+
+**Features:**
+- Auto-reconnects on SSH connection loss
+- Desktop notifications for progress/errors
+- Dad joke heartbeat (confirms bot is alive)
+- Periodic node-level status checks (every 10 transactions)
+
+**SSH Config Requirements** (`~/.ssh/config`):
+```
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist yes
+    ServerAliveInterval 30
+    TCPKeepAlive yes
+```
+
+## Monitoring Progress
+
+### Two Different Metrics
+
+**Important:** There are two ways to measure migration progress:
+
+1. **Pallet Counter** (bot activity):
+   ```bash
+   ./westend-migrate --status
+   ```
+   Shows `top_items` - cumulative items processed (~1024 per tx)
+
+2. **Node RPC** (actual progress):
+   ```bash
+   curl -s -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"state_trieMigrationStatus","params":[]}' \
+     http://127.0.0.1:9944 | jq '.result'
+   ```
+   Shows `topRemainingToMigrate` - actual V0 keys left (authoritative)
+
+**Migration phases:**
+- **Bulk phase** (~99%): Fast progress, pallet and node metrics correlate
+- **Stragglers phase** (final ~1%): Pallet counter increases but node RPC decreases slowly - this is NORMAL
+
+The node RPC takes ~27 seconds to run (full trie scan), so check it periodically, not continuously.
+
 ## License
 
 MIT
