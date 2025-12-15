@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+westend-migrate-stripped
+
+# Sensitive files - NEVER commit these!
+.env
+seed.txt
+seed.txt.zip
+
+# Dev docs (local only)
+DEV_NOTES.md
+GEMINI.md
+STATE_TRIE_MIGRATION.md
+
+# Runtime files
+*.log
+*.pid
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,46 @@
+[package]
+name = "westend-migration-bot"
+version = "0.2.0"
+edition = "2021"
+description = "Bot to run signed state-trie migration on Westend"
+license = "MIT"
+
+[dependencies]
+# Subxt for chain interaction
+subxt = "0.37"
+subxt-signer = { version = "0.37", features = ["subxt", "sr25519"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "signal"] }
+tokio-util = "0.7"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake2 = "0.10"
+reqwest = { version = "0.11", features = ["json"] }
+notify-rust = "4"
+
+# Codec for manual encoding if needed
+parity-scale-codec = { version = "3", features = ["derive"] }
+
+[[bin]]
+name = "westend-migrate"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
