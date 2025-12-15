@@ -20,3 +20,7 @@ STATE_TRIE_MIGRATION.md
 .idea/
 .vscode/
 *.swp
+
+.gemini/
+gha-creds-*.json
+INTERNAL_REVIEW.md
