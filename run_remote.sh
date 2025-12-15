@@ -42,5 +42,9 @@ ssh "$SERVER" "export SIGNER_SEED='$SEED'; ~/westend-migrate --rpc-url ws://127.
         notify-send -u critical "CRITICAL WARNING" "$line"
     elif [[ "$line" == *"Westend State-Trie Migration Bot"* ]]; then
         notify-send "Westend Bot Started" "Running remotely on $SERVER" -t 5000
+    elif [[ "$line" == *"💓"* ]]; then
+        # Dad joke heartbeat - silent/low priority
+        joke="${line#*💓 }"
+        notify-send -u low "🤣" "$joke" -t 8000
     fi
 done
