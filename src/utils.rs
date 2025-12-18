@@ -70,8 +70,10 @@ pub struct MigrationStatus {
 }
 
 impl MigrationStatus {
+    /// Migration is complete when top is complete (matches Parity's TypeScript bot)
+    /// Child migration happens inline with top, so progress_child may stay ToStart
     pub fn is_complete(&self) -> bool {
-        self.top_complete && self.child_complete
+        self.top_complete
     }
 }
 
@@ -437,15 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_status_partial_complete() {
+    fn test_migration_status_top_complete() {
+        // When top is complete, migration is done (child migrates inline)
         let status = MigrationStatus {
             top_complete: true,
-            child_complete: false,
+            child_complete: false, // Can stay false/ToStart
             size: 5000,
             top_items: 1000,
             child_items: 500,
         };
-        assert!(!status.is_complete());
+        assert!(status.is_complete()); // Now returns true!
     }
 
     #[test]
