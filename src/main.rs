@@ -16,11 +16,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use error::MigrationError;
 use secrecy::{ExposeSecret, SecretString};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    OnceLock,
-};
+use std::fs::File;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use fs2::FileExt;
 use subxt::{
     backend::{legacy::LegacyRpcMethods, rpc::RpcClient},
     dynamic::{At, Value},
@@ -35,7 +34,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use utils::{
     check_balance_decrease, decode_validity_error, disable_notifications, fetch_dad_joke,
-    parse_migration_status, send_notification, MigrationStatus,
+    parse_migration_status, send_notification, MigrationStatus, ValidityError,
 };
 
 const DEFAULT_WESTEND_RPC: &str = "wss://westend-asset-hub-rpc.polkadot.io";
@@ -49,17 +48,13 @@ const BANNED_TX_WAIT_SECS: u64 = 60;
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const MAX_CONSECUTIVE_ERRORS: u32 = 5; // Stop after this many consecutive failures
 
-/// Simple timer showing elapsed seconds since start
-static START: OnceLock<Instant> = OnceLock::new();
+/// Timer showing local date/time
+struct LocalTimer;
 
-struct SecsTimer;
-
-impl FormatTime for SecsTimer {
+impl FormatTime for LocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        let elapsed = START.get_or_init(Instant::now).elapsed();
-        let secs = elapsed.as_secs();
-        let ms = elapsed.subsec_millis();
-        write!(w, "{:>4}.{:03}s", secs, ms)
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%m-%d %H:%M:%S"))
     }
 }
 
@@ -552,6 +547,10 @@ impl MigrationBot {
             self.config.item_limit, self.config.size_limit
         );
 
+        // Capture nonce before submission for timeout verification
+        let account_id = <Keypair as Signer<PolkadotConfig>>::account_id(&self.signer);
+        let expected_nonce = self.get_account_nonce(&account_id).await.unwrap_or(0);
+
         // MigrationLimits { size: u32, item: u32 }
         let limits = Value::named_composite([
             ("size", Value::u128(self.config.size_limit as u128)),
@@ -570,76 +569,101 @@ impl MigrationBot {
         );
 
         // Create signed transaction for dry run validation
-        let dry_run_tx = self
-            .client
-            .tx()
-            .create_signed(&tx, &self.signer, Default::default())
-            .await
-            .context("Failed to create signed tx for dry run")?;
+        // Retry loop handles stale nonce (when previous tx finalized between nonce fetch and dry run)
+        const MAX_DRY_RUN_RETRIES: u32 = 3;
+        let mut dry_run_tx = None;
 
-        // DRY RUN using system_dryRun RPC - actually executes the call
-        // This catches dispatch errors (like SizeUpperBoundExceeded) that would cause slashing
-        // NOTE: system_dryRun requires --rpc-methods=unsafe on the node
-        // We remember if it's not supported to skip on future calls
-        if self.dry_run_supported.load(Ordering::Relaxed) {
-            info!("Dry run...");
+        for retry in 0..MAX_DRY_RUN_RETRIES {
+            // Re-sign transaction to get fresh nonce
+            let signed_tx = self
+                .client
+                .tx()
+                .create_signed(&tx, &self.signer, Default::default())
+                .await
+                .context("Failed to create signed tx for dry run")?;
 
-            let tx_bytes = dry_run_tx.encoded();
-            let dry_run_result = self.rpc.dry_run(tx_bytes, None).await;
+            // DRY RUN using system_dryRun RPC - actually executes the call
+            // This catches dispatch errors (like SizeUpperBoundExceeded) that would cause slashing
+            // NOTE: system_dryRun requires --rpc-methods=unsafe on the node
+            // We remember if it's not supported to skip on future calls
+            if self.dry_run_supported.load(Ordering::Relaxed) {
+                info!("Dry run...");
 
-            use subxt::backend::legacy::rpc_methods::DryRunResult;
-            match dry_run_result {
-                Ok(dry_run_bytes) => {
-                    // Store raw bytes for detailed error analysis
-                    let raw_bytes = dry_run_bytes.0.clone();
+                let tx_bytes = signed_tx.encoded();
+                let dry_run_result = self.rpc.dry_run(tx_bytes, None).await;
 
-                    match dry_run_bytes.into_dry_run_result(&self.client.metadata()) {
-                        Ok(DryRunResult::Success) => {
-                            info!("Dry run OK");
-                        }
-                        Ok(DryRunResult::DispatchError(dispatch_err)) => {
-                            let err_str = format!("{:?}", dispatch_err);
-                            error!("Dry run FAILED - dispatch error: {}", err_str);
+                use subxt::backend::legacy::rpc_methods::DryRunResult;
+                match dry_run_result {
+                    Ok(dry_run_bytes) => {
+                        // Store raw bytes for detailed error analysis
+                        let raw_bytes = dry_run_bytes.0.clone();
 
-                            if err_str.contains("SizeUpperBoundExceeded") {
-                                return Err(MigrationError::SizeExceeded.into());
+                        match dry_run_bytes.into_dry_run_result(&self.client.metadata()) {
+                            Ok(DryRunResult::Success) => {
+                                info!("Dry run OK");
+                                dry_run_tx = Some(signed_tx);
+                                break; // Success - exit retry loop
                             }
-                            return Err(MigrationError::DryRunDispatchError(err_str).into());
-                        }
-                        Ok(DryRunResult::TransactionValidityError) => {
-                            // Decode the raw bytes to get detailed validity error
-                            // Format: Result<Result<(), DispatchError>, TransactionValidityError>
-                            // Err variant (0x01) followed by validity error details
-                            let validity_error = decode_validity_error(&raw_bytes);
-                            error!(
-                                "Dry run FAILED - transaction validity error: {}",
-                                validity_error
-                            );
+                            Ok(DryRunResult::DispatchError(dispatch_err)) => {
+                                let err_str = format!("{:?}", dispatch_err);
+                                error!("Dry run FAILED - dispatch error: {}", err_str);
 
-                            // Convert to MigrationError for structured handling
-                            return Err(MigrationError::from_validity_error(validity_error).into());
+                                if err_str.contains("SizeUpperBoundExceeded") {
+                                    return Err(MigrationError::SizeExceeded.into());
+                                }
+                                return Err(MigrationError::DryRunDispatchError(err_str).into());
+                            }
+                            Ok(DryRunResult::TransactionValidityError) => {
+                                // Decode the raw bytes to get detailed validity error
+                                let validity_error = decode_validity_error(&raw_bytes);
+
+                                // If stale nonce, retry immediately with fresh signature
+                                if matches!(validity_error, ValidityError::Stale) && retry < MAX_DRY_RUN_RETRIES - 1 {
+                                    warn!("Dry run got stale nonce, re-signing tx (attempt {}/{})", retry + 1, MAX_DRY_RUN_RETRIES);
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    continue; // Retry with fresh nonce
+                                }
+
+                                error!(
+                                    "Dry run FAILED - transaction validity error: {}",
+                                    validity_error
+                                );
+                                return Err(MigrationError::from_validity_error(validity_error).into());
+                            }
+                            Err(e) => {
+                                warn!("Could not decode dry run result: {:?}", e);
+                                dry_run_tx = Some(signed_tx);
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Could not decode dry run result: {:?}", e);
+                    }
+                    Err(e) => {
+                        // Public RPCs don't allow system_dryRun - remember and skip future calls
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("unsafe") {
+                            warn!(
+                                "system_dryRun not available (requires --rpc-methods=unsafe on node)"
+                            );
+                            warn!("Disabling dry run for this session - USE AT YOUR OWN RISK!");
+                            self.dry_run_supported.store(false, Ordering::Relaxed);
+                            dry_run_tx = Some(signed_tx);
+                            break;
+                        } else {
+                            error!("Dry run RPC error: {}", err_str);
+                            return Err(MigrationError::RpcError(err_str).into());
                         }
                     }
                 }
-                Err(e) => {
-                    // Public RPCs don't allow system_dryRun - remember and skip future calls
-                    let err_str = format!("{:?}", e);
-                    if err_str.contains("unsafe") {
-                        warn!(
-                            "system_dryRun not available (requires --rpc-methods=unsafe on node)"
-                        );
-                        warn!("Disabling dry run for this session - USE AT YOUR OWN RISK!");
-                        self.dry_run_supported.store(false, Ordering::Relaxed);
-                    } else {
-                        error!("Dry run RPC error: {}", err_str);
-                        return Err(MigrationError::RpcError(err_str).into());
-                    }
-                }
+            } else {
+                // Dry run not supported, just use the signed tx
+                dry_run_tx = Some(signed_tx);
+                break;
             }
         }
+
+        let dry_run_tx = dry_run_tx.ok_or_else(|| {
+            MigrationError::DryRunDispatchError("Failed to create valid transaction after retries".to_string())
+        })?;
 
         if self.config.dry_run {
             info!("[DRY RUN] Would submit continue_migrate transaction");
@@ -687,13 +711,36 @@ impl MigrationBot {
         // Wait for FINALIZATION (not just inclusion) - this is critical!
         // TypeScript bot uses sendAndFinalize() which waits for finalization
         // State only propagates reliably after finalization
+        //
+        // IMPORTANT: Add timeout because WebSocket subscriptions can lose events
+        let finalization_timeout = Duration::from_secs(120); // 2 minutes max wait
+        let start_time = Instant::now();
+        let mut included = false;
+
         while let Some(status) = progress.next().await {
+            // Check timeout
+            if start_time.elapsed() > finalization_timeout {
+                warn!("Finalization timeout after {:?}, checking nonce...", start_time.elapsed());
+
+                // Verify TX was applied by checking if nonce changed
+                let current_nonce = self.get_account_nonce(&account_id).await?;
+                if current_nonce > expected_nonce {
+                    info!("Nonce advanced ({} -> {}), TX was finalized (missed event)", expected_nonce, current_nonce);
+                    return Ok(());
+                } else {
+                    return Err(MigrationError::SubmissionFailed(
+                        "Finalization timeout - TX may be stuck".to_string()
+                    ).into());
+                }
+            }
+
             match status? {
                 subxt::tx::TxStatus::Broadcasted { num_peers } => {
                     info!("Broadcast to {} peers", num_peers);
                 }
                 subxt::tx::TxStatus::InBestBlock(block) => {
                     info!("Included {:?}...", block.block_hash());
+                    included = true;
                     // Don't break here - continue waiting for finalization
                 }
                 subxt::tx::TxStatus::InFinalizedBlock(block) => {
@@ -716,6 +763,16 @@ impl MigrationBot {
                     return Err(MigrationError::TxDropped(message).into());
                 }
                 _ => {}
+            }
+        }
+
+        // If we exit the loop without breaking (stream ended), check if TX succeeded
+        if included {
+            warn!("Progress stream ended without finalization event, checking nonce...");
+            let current_nonce = self.get_account_nonce(&account_id).await?;
+            if current_nonce > expected_nonce {
+                info!("Nonce advanced ({} -> {}), TX was finalized (stream ended early)", expected_nonce, current_nonce);
+                return Ok(());
             }
         }
 
@@ -801,10 +858,10 @@ impl MigrationBot {
             None => {
                 // No chain limits set - use sensible defaults if config is 0
                 if self.config.item_limit == 0 {
-                    self.config.item_limit = 2048;
+                    self.config.item_limit = 4096;
                 }
                 if self.config.size_limit == 0 {
-                    self.config.size_limit = 204800;
+                    self.config.size_limit = 409600;
                 }
                 info!(
                     "Setting chain limits: items={}, size={}",
@@ -996,9 +1053,22 @@ impl MigrationBot {
     }
 }
 
+const LOCKFILE_PATH: &str = "/tmp/westend-migrate.lock";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Acquire exclusive lock to prevent multiple instances
+    let lockfile = File::create(LOCKFILE_PATH)
+        .context("Failed to create lockfile")?;
+
+    if lockfile.try_lock_exclusive().is_err() {
+        eprintln!("ERROR: Another instance is already running (lockfile: {})", LOCKFILE_PATH);
+        eprintln!("If this is incorrect, delete the lockfile and try again.");
+        std::process::exit(1);
+    }
+    // Lock is held for the lifetime of the process and released on exit
 
     // Disable desktop notifications if running headless
     if cli.no_notify {
@@ -1012,7 +1082,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| log_level.into()),
         )
-        .with_timer(SecsTimer)
+        .with_timer(LocalTimer)
         .with_target(false)
         .compact()
         .init();

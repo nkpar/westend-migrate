@@ -21,6 +21,16 @@ STATE_TRIE_MIGRATION.md
 .vscode/
 *.swp
 
+# Python
+__pycache__/
+*.pyc
+
+# AI assistants
 .gemini/
+.claude/
+
+# Credentials
 gha-creds-*.json
+
+# Internal docs (not for repo)
 INTERNAL_REVIEW.md
